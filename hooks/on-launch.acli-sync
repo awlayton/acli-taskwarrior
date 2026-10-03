@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+#
+# on-launch.acli-sync -- Taskwarrior on-launch hook.
+#
+# Iterates over every config file in the bundle's `acli-sync/config.d/`
+# (next to the installed hooks) or in `$ACLI_SYNC_CONFIG_DIR` if set;
+# each file is a whole config and may target a distinct Jira account,
+# filter, or project. For each config it fetches the matching Jira
+# snapshot via `acli` and reconciles the local task list. New issues are
+# batched into one `task import` call whose records carry the
+# deterministic UUID derived from their jirakey UDA. Matched tasks have
+# their status and description reconciled in place. Deleted or waiting
+# tasks that carry a jirakey are left untouched (never re-added, never
+# clobbered). The same jirakey is processed at most once across all
+# configs (de-duplicated by an in-memory key set).
+#
+# Input:  none (stdin is not read).
+# Output: no JSON on stdout; feedback lines on stderr.
+# Exit:   0 on success (or graceful degradation such as a per-config acli
+#         fetch failure or an unloadable individual config); 1 only when
+#         the config directory itself is missing.
+#
+# Synopsis:
+#   installed as  <hooks.location>/on-launch.acli-sync  (executable)
+#   invoked by Taskwarrior (v2 hook args): api:2 args:... command:... rc:...
+#   data:... version:...
+set -u
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=acli-sync/lib/acli-sync-lib.bash
+source "$SELF_DIR/acli-sync/lib/acli-sync-lib.bash"
+
+# Hooks API v2 hands us api:2 plus rc:/data:/command:/version:... args. We
+# consume them so internal `task` calls see the exact config in effect and
+# so we can skip mirroring when the user is already mid-add or mid-import
+# (which would race their task's UUID assignment).
+ACLI_SYNC_DATA_DIR=""
+ACLI_SYNC_RC=""
+ACLI_SYNC_HOOK_COMMAND=""
+for arg in "$@"; do
+  case "$arg" in
+  data:*) ACLI_SYNC_DATA_DIR="${arg#data:}" ;;
+  rc:*) ACLI_SYNC_RC="${arg#rc:}" ;;
+  command:*) ACLI_SYNC_HOOK_COMMAND="${arg#command:}" ;;
+  esac
+done
+: "${ACLI_SYNC_DATA_DIR:=${TASKDATA:-${XDG_DATA_HOME:-$HOME/.local/share}/task}}"
+
+# Skip mirroring while the user is mid-add or mid-import. Mirroring in those
+# contexts would race the user's task: the user's just-saved task may not
+# yet be visible to our `task export` (we read via rc.hooks=off before the
+# user's commit lands), so on-launch would mirror a *second* task for the
+# same jirakey. New Jira issues still get mirrored at the NEXT
+# `task list`/`task next`/etc invocation, which is the typical cadence.
+case "${ACLI_SYNC_HOOK_COMMAND:-}" in
+add | import)
+  exit 0
+  ;;
+esac
+
+# --- Config discovery --------------------------------------------------------
+# Default config dir is the bundle's own `acli-sync/config.d/` next to
+# this hook, so hooks + lib + taskrc + configs all co-locate under one XDG
+# path (the installer's `$HOOK_DEST`). Override with $ACLI_SYNC_CONFIG_DIR
+# to put configs anywhere else.
+bundle_dir="$SELF_DIR/acli-sync"
+config_dir="${ACLI_SYNC_CONFIG_DIR:-$bundle_dir/config.d}"
+[ -d "$config_dir" ] || {
+  echo "acli-sync: config dir not found: $config_dir" >&2
+  exit 1
+}
+
+mapfile -t config_files < <(acli_sync::list_config_files "$config_dir")
+if [ "${#config_files[@]}" -eq 0 ]; then
+  acli_sync::log "no *.conf/*.bash files in $config_dir; nothing to mirror"
+  exit 0
+fi
+
+# --- Index existing tasks by jirakey UDA once ---------------------------------
+# All statuses are exported and indexed (not just pending/completed) so a
+# deleted or waiting task with a jirakey is still matched and never mirrored a
+# second time. TW 3.x ignores status filters on `export`, so filtering happens
+# in jq instead. Using the FIRST config's $jira_key_uda is sufficient because
+# in practice all configs share the UDA name; if a config overrides it, the
+# later config's overrides apply during the loop and its existence test still
+# uses whatever was sourced last (which is consistent across the hook call).
+existing_json=$(acli_sync::task export rc.json.array=on 2>/dev/null || true)
+existing_keys_jq=$(printf '%s' "$existing_json" | jq -c --arg kd "${jira_key_uda:-jirakey}" \
+  '[.[] | select(.[$kd] != null and .[$kd] != "") | {key: .[$kd], uuid, status, description}] | unique_by(.key)' \
+  2>/dev/null || printf '%s\n' "[]")
+
+# Dedupe by jirakey across configs: this hook run processes each key at
+# most once regardless of how many configs surface it. (Typically configs
+# target non-overlapping filters, so dedupe is rarely needed; we keep it
+# for safety.)
+declare -A seen
+new_issues=()
+
+# --- Per-config iteration ----------------------------------------------------
+for config_path in "${config_files[@]}"; do
+  if ! acli_sync::source_config_file "$config_path"; then
+    acli_sync::log "skipping config (source failed): $config_path"
+    continue
+  fi
+  if ! acli_sync::require_a_cli; then
+    acli_sync::log "skipping config (acli check failed): $config_path"
+    continue
+  fi
+  acli_sync::log "processing config: $config_path (filter='${filter:-}' jql='${jql:-}')"
+
+  snapshot=$(acli_sync::fetch_jira) || {
+    acli_sync::log "acli fetch failed for $config_path; continuing"
+    continue
+  }
+
+  while IFS= read -r issue; do
+    [ -z "$issue" ] && continue
+    key=$(printf '%s' "$issue" | jq -r '.key // ""')
+    [ -z "$key" ] && continue
+    if [ -n "${seen[$key]:-}" ]; then
+      continue
+    fi
+    seen[$key]=1
+
+    summary=$(printf '%s' "$issue" | jq -r '.summary // ""')
+    jira_status=$(printf '%s' "$issue" | jq -r '.status // "Unknown"')
+    tw_status=$(acli_sync::status_for_jira "$jira_status")
+
+    matched_uuid=$(printf '%s' "$existing_keys_jq" | jq -r --arg k "$key" \
+      '.[] | select(.key == $k) | .uuid' 2>/dev/null | head -n 1)
+
+    if [ -z "$matched_uuid" ]; then
+      # Defer until end of loop; we'll batch-import once below.
+      # Bake the per-config $project (and per-config priority when set)
+      # into the flat record so the batched `task import` later doesn't
+      # inherit a later config's values just because we ran past this
+      # config's iteration.
+      if [ -n "$project" ]; then
+        issue=$(printf '%s' "$issue" | jq -c --arg p "$project" '. + {project: $p}')
+      fi
+      new_issues+=("$issue")
+      acli_sync::log "queued $key for import: $summary"
+      continue
+    fi
+
+    # Matched task: only reconcile the states we manage.
+    current_status=$(printf '%s' "$existing_keys_jq" | jq -r --arg u "$matched_uuid" \
+      '.[] | select(.uuid == $u) | .status' 2>/dev/null | head -n 1)
+    case "$current_status" in
+    pending | completed) ;;
+    *) continue ;;
+    esac
+
+    if [ "$current_status" != "$tw_status" ]; then
+      if acli_sync::task "$matched_uuid" modify "status:$tw_status" >/dev/null 2>&1; then
+        acli_sync::log "updated $key status: $current_status -> $tw_status"
+      else
+        acli_sync::log "failed to update $key status"
+      fi
+    fi
+
+    # Jira is the source of truth for summaries; set sync_description_on_launch=0
+    # to keep locally-edited descriptions.
+    current_desc=$(printf '%s' "$existing_keys_jq" | jq -r --arg u "$matched_uuid" \
+      '.[] | select(.uuid == $u) | .description' 2>/dev/null | head -n 1)
+    if [ "${sync_description_on_launch:-1}" = "1" ] && [ -n "$summary" ] && [ "$current_desc" != "$summary" ]; then
+      if acli_sync::task "$matched_uuid" modify "description:$summary" >/dev/null 2>&1; then
+        acli_sync::log "updated $key description"
+      else
+        acli_sync::log "failed to update $key description"
+      fi
+    fi
+  done < <(printf '%s' "$snapshot" | jq -c '.[]')
+done
+
+# --- Bulk import ------------------------------------------------------------
+# Importing in one `task import` call is one inner Taskwarrior process; that
+# inner process re-fires on-launch but its `command:import` makes our skip
+# clause above handle the recursion safely.
+if [ "${#new_issues[@]}" -gt 0 ]; then
+  if printf '%s\n' "${new_issues[@]}" | acli_sync::task_import_records; then
+    acli_sync::log "imported ${#new_issues[@]} task(s) from ${#config_files[@]} config(s)"
+  else
+    acli_sync::log "failed to import ${#new_issues[@]} Jira task(s)"
+  fi
+fi
+
+exit 0

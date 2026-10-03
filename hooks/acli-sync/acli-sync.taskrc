@@ -1,0 +1,9 @@
+# acli-sync UDA definitions. Append these lines to ~/.taskrc (or point a
+# TASKRC file at this file). The hook-internal `task` calls always run with
+# rc.color=no and rc.hooks=off so they never recurse and never add color codes.
+uda.jirakey.type=string
+uda.jirakey.label=Jira Key
+uda.jirastatus.type=string
+uda.jirastatus.label=Jira Status
+uda.jiraurl.type=string
+uda.jiraurl.label=Jira URL

@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+#
+# on-modify.acli-sync -- Taskwarrior on-modify hook.
+#
+# Pushes Taskwarrior edits back to Jira (via acli) for tasks that carry the
+# jirakey UDA. Configs are iterated alphabetically from
+# `~/.config/acli-sync/config.d/` (or `$ACLI_SYNC_CONFIG_DIR`); the LAST
+# sourced config's `sync_on_modify`, `complete_jira_status`,
+# `reopen_jira_status`, `jira_key_uda`, `jira_status_uda`, and
+# `sync_description_/labels_on_modify` values win (so users can override
+# defaults in a final `99-overrides.conf`). Status changes become
+# transitions, description changes become summary edits, tag changes
+# become label edits (only when enabled). The hook never vetoes: it
+# always exits 0 and echoes the (possibly updated) modified task JSON as
+# the first stdout line.
+#
+# Input:  line 1 = original task JSON, line 2 = modified task JSON (read with
+#         `read -r` so backslashes are preserved).
+# Output: line 1 = modified task JSON (the jirastatus UDA is updated when a
+#         status change was synced); subsequent lines = feedback.
+# Exit:   always 0 (fail-open; a broken config or missing jq still passes the
+#         modification through untouched).
+#
+# Synopsis:
+#   installed as  <hooks.location>/on-modify.acli-sync  (executable)
+#   invoked by Taskwarrior (v2 hook args): api:2 args:... command:... rc:...
+#   data:... version:...
+set -u
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=acli-sync/lib/acli-sync-lib.bash
+source "$SELF_DIR/acli-sync/lib/acli-sync-lib.bash"
+
+ACLI_SYNC_DATA_DIR=""
+ACLI_SYNC_RC=""
+for arg in "$@"; do
+  case "$arg" in
+  data:*) ACLI_SYNC_DATA_DIR="${arg#data:}" ;;
+  rc:*) ACLI_SYNC_RC="${arg#rc:}" ;;
+  esac
+done
+
+IFS= read -r original || original=""
+IFS= read -r modified || modified=""
+[ -z "$modified" ] && exit 0
+
+# Fail open when jq is missing: pass the modification through untouched.
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' "$modified"
+  exit 0
+fi
+
+# --- Config discovery --------------------------------------------------------
+# Default config dir is the bundle's own `acli-sync/config.d/` next to
+# this hook, so hooks + lib + taskrc + configs all co-locate under one XDG
+# path (the installer's `$HOOK_DEST`). Override with $ACLI_SYNC_CONFIG_DIR
+# to put configs anywhere else.
+#
+# Iterate every config file (last-wins alphabetical). A missing config dir
+# or empty dir means there's no sync-on-modify behavior to apply — pass
+# the modification through cleanly. Per-config sourcing failures are
+# logged but do not abort; late-iteration failures just override earlier
+# values with defaults if they don't address the failing key.
+bundle_dir="$SELF_DIR/acli-sync"
+config_dir="${ACLI_SYNC_CONFIG_DIR:-$bundle_dir/config.d}"
+if [ -d "$config_dir" ]; then
+  any_loaded=0
+  while IFS= read -r config_path; do
+    [ -z "$config_path" ] && continue
+    if acli_sync::source_config_file "$config_path" 2>/dev/null; then
+      any_loaded=1
+    else
+      acli_sync::log "skipping config (source failed): $config_path"
+    fi
+  done < <(acli_sync::list_config_files "$config_dir")
+fi
+
+# Honour the LAST config's sync_on_modify. With no config loaded we fall
+# back to defaults (sync_on_modify=0 from set_config_defaults).
+if [ "${sync_on_modify:-0}" != "1" ]; then
+  printf '%s\n' "$modified"
+  exit 0
+fi
+
+# Only tasks that carry the jirakey UDA are synced back.
+key=$(printf '%s' "$modified" | jq -r --arg k "$jira_key_uda" '.[$k] // ""')
+if [ -z "$key" ]; then
+  printf '%s\n' "$modified"
+  exit 0
+fi
+
+orig_status=$(printf '%s' "$original" | jq -r '.status // ""')
+new_status=$(printf '%s' "$modified" | jq -r '.status // ""')
+orig_desc=$(printf '%s' "$original" | jq -r '.description // ""')
+new_desc=$(printf '%s' "$modified" | jq -r '.description // ""')
+orig_tags=$(printf '%s' "$original" | jq -r '.tags // [] | join(",")')
+new_tags=$(printf '%s' "$modified" | jq -r '.tags // [] | join(",")')
+
+modified_out="$modified"
+feed=()
+
+# --- Status: task <-> completed maps to a Jira transition --------------------
+if [ "$orig_status" = "pending" ] && [ "$new_status" = "completed" ]; then
+  if "$acli_bin" jira workitem transition --key "$key" --status "$complete_jira_status" --yes >/dev/null 2>&1; then
+    modified_out=$(printf '%s' "$modified_out" | jq -c --arg k "$jira_status_uda" --arg v "$complete_jira_status" '.[$k] = $v')
+    feed+=("Synced $key: status pending -> $complete_jira_status")
+  else
+    feed+=("Sync FAILED for $key: transition to $complete_jira_status")
+  fi
+elif [ "$orig_status" = "completed" ] && [ "$new_status" = "pending" ]; then
+  if "$acli_bin" jira workitem transition --key "$key" --status "$reopen_jira_status" --yes >/dev/null 2>&1; then
+    modified_out=$(printf '%s' "$modified_out" | jq -c --arg k "$jira_status_uda" --arg v "$reopen_jira_status" '.[$k] = $v')
+    feed+=("Synced $key: status completed -> $reopen_jira_status")
+  else
+    feed+=("Sync FAILED for $key: transition to $reopen_jira_status")
+  fi
+fi
+
+# --- Description: push summary edits -----------------------------------------
+if [ "${sync_description_on_modify:-1}" = "1" ] && [ "$orig_desc" != "$new_desc" ]; then
+  if "$acli_bin" jira workitem edit --key "$key" --summary "$new_desc" --yes >/dev/null 2>&1; then
+    feed+=("Synced $key: summary updated")
+  else
+    feed+=("Sync FAILED for $key: summary edit")
+  fi
+fi
+
+# --- Tags: optional label sync (off by default) ------------------------------
+if [ "${sync_labels_on_modify:-0}" = "1" ] && [ "$orig_tags" != "$new_tags" ]; then
+  if [ -n "$new_tags" ]; then
+    if "$acli_bin" jira workitem edit --key "$key" --labels "$new_tags" --yes >/dev/null 2>&1; then
+      feed+=("Synced $key: labels -> $new_tags")
+    else
+      feed+=("Sync FAILED for $key: labels edit")
+    fi
+  elif [ -n "$orig_tags" ]; then
+    if "$acli_bin" jira workitem edit --key "$key" --remove-labels "$orig_tags" --yes >/dev/null 2>&1; then
+      feed+=("Synced $key: labels cleared")
+    else
+      feed+=("Sync FAILED for $key: labels clear")
+    fi
+  fi
+fi
+
+# The modified task JSON must be the FIRST stdout line; everything after is
+# feedback that Taskwarrior displays as footnotes.
+printf '%s\n' "$modified_out"
+[ "${#feed[@]}" -gt 0 ] && printf '%s\n' "${feed[@]}"
+exit 0
